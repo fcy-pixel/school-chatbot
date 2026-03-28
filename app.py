@@ -72,12 +72,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("📤 上載 PDF 文件")
-    save_to_github = st.toggle(
-        "儲存到 GitHub（下次自動載入）",
-        value=True,
-        help="開啟後上載的 PDF 會自動儲存到 GitHub 倉庫。\n"
-             "需要填寫 GitHub Token（repo 寫入權限）。",
-    )
     uploaded_files = st.file_uploader(
         "直接拖放 PDF（可多選）",
         type=["pdf"],
@@ -182,8 +176,6 @@ if upload_btn and uploaded_files:
     else:
         bot = get_chatbot()
         names: list[str] = []
-        saved_to_gh: list[str] = []
-        failed_gh:   list[str] = []
         progress = st.sidebar.progress(0, text="正在處理上傳文件…")
         total_chunks = 0
 
@@ -192,18 +184,9 @@ if upload_btn and uploaded_files:
                 int(i / len(uploaded_files) * 100),
                 text=f"正在讀取 {uf.name}…",
             )
-            pdf_bytes = uf.getvalue()
-            n = bot.ingest_uploaded_pdf(uf.name, pdf_bytes)
+            n = bot.ingest_uploaded_pdf(uf.name, uf.getvalue())
             total_chunks += n
             names.append(uf.name)
-
-            # Push to GitHub for permanent storage
-            if save_to_github and github_repo and github_token:
-                try:
-                    bot.push_pdf_to_github(uf.name, pdf_bytes)
-                    saved_to_gh.append(uf.name)
-                except ChatbotError as gh_err:
-                    failed_gh.append(f"{uf.name}：{gh_err}")
 
         progress.empty()
 
@@ -212,20 +195,7 @@ if upload_btn and uploaded_files:
         st.session_state.index_ready = True
         st.session_state.chunk_count = len(bot._chunk_index)
 
-        msg = f"✅ 已加入 {len(names)} 個文件，新增 {total_chunks} 個片段"
-        if saved_to_gh:
-            msg += f"\n💾 已永久儲存到 GitHub：{', '.join(saved_to_gh)}"
-        st.sidebar.success(msg)
-        for fe in failed_gh:
-            st.sidebar.warning(f"⚠️ GitHub 儲存失敗 — {fe}")
-
-        # Auto-refresh PDF list if files were saved to GitHub
-        if saved_to_gh and github_repo:
-            try:
-                pdfs = bot.get_pdf_list(force_refresh=True)
-                st.session_state.pdf_list = pdfs
-            except Exception:
-                pass
+        st.sidebar.success(f"✅ 已加入 {len(names)} 個文件，新增 {total_chunks} 個片段")
         st.rerun()
 
 if index_btn:
