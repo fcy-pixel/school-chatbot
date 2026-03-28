@@ -2,28 +2,44 @@
 School Affairs Chatbot — Core Logic
 - Fetches PDF list from a GitHub repository
 - Extracts text from PDFs
-- Uses Qwen (Alibaba Cloud International) to pick relevant files and answer questions
+- Builds an in-memory full-text chunk index so queries work even when
+  filenames don't reflect content (e.g. monthly meeting minutes that
+  contain many different topics)
+- Uses Qwen (Alibaba Cloud International) to answer questions
 """
 
 import io
 import re
 import json
 import requests
-from typing import Optional
+from typing import Optional, Generator
 from openai import OpenAI
 import pypdf
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 QWEN_BASE_URL   = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL   = "qwen-plus"
-CHUNK_SIZE      = 1500   # characters per chunk
-CHUNK_OVERLAP   = 200    # overlap between chunks
-MAX_CHUNKS      = 3      # top-N chunks per PDF sent to AI
-MAX_CTX_PER_PDF = 4500   # hard cap on characters per PDF in the prompt
+CHUNK_SIZE      = 800    # characters per chunk (smaller = more precise retrieval)
+CHUNK_OVERLAP   = 150    # overlap between chunks
+TOP_K_CHUNKS    = 6      # top-N chunks across ALL files sent to AI
+MAX_CTX_CHARS   = 6000   # hard cap on total context characters in the prompt
 
 
 class ChatbotError(Exception):
     pass
+
+
+# A single indexed chunk
+class Chunk:
+    __slots__ = ("text", "source", "page_hint", "tokens_cjk", "tokens_latin")
+
+    def __init__(self, text: str, source: str, page_hint: str):
+        self.text        = text
+        self.source      = source      # PDF filename
+        self.page_hint   = page_hint   # e.g. "[第 3 頁]" prefix, may be empty
+        # Pre-tokenise for fast scoring
+        self.tokens_cjk   = {c for c in text if "\u4e00" <= c <= "\u9fff"}
+        self.tokens_latin = set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
 
 
 class SchoolChatbot:
@@ -48,8 +64,15 @@ class SchoolChatbot:
 
         self._pdf_text_cache: dict[str, str] = {}
         self._pdf_list_cache: Optional[list[dict]] = None
+        # Full-text chunk index: built by build_index()
+        self._chunk_index: list[Chunk] = []
+        self._indexed_pdfs: set[str]   = set()   # filenames already indexed
 
     # ── GitHub helpers ─────────────────────────────────────────────────────────
+
+    @property
+    def index_ready(self) -> bool:
+        return len(self._chunk_index) > 0
 
     def _gh_headers(self) -> dict:
         h = {"Accept": "application/vnd.github.v3+json"}
@@ -99,7 +122,7 @@ class SchoolChatbot:
     # ── PDF text extraction ────────────────────────────────────────────────────
 
     def extract_pdf_text(self, pdf: dict) -> str:
-        """Download a PDF and return its extracted text. Results are cached."""
+        """Download a PDF and return its extracted text (with page headers). Cached."""
         name = pdf["name"]
         if name in self._pdf_text_cache:
             return self._pdf_text_cache[name]
@@ -122,43 +145,121 @@ class SchoolChatbot:
         self._pdf_text_cache[name] = result
         return result
 
-    # ── Relevance scoring ──────────────────────────────────────────────────────
+    # ── Full-text chunk index ──────────────────────────────────────────────────
 
-    def _rank_chunks(self, query: str, text: str) -> list[tuple[str, float]]:
-        """Split text into overlapping chunks and rank by query relevance."""
-        # CJK character overlap + Latin word overlap
-        q_cjk   = {c for c in query if "\u4e00" <= c <= "\u9fff"}
-        q_latin = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
+    def _make_chunks(self, text: str, source: str) -> list[Chunk]:
+        """Split text into overlapping Chunk objects."""
+        # Detect page-header lines like "[第 N 頁]"
+        page_pattern = re.compile(r"\[第\s*\d+\s*頁\]")
+        current_page = ""
+        chunks: list[Chunk] = []
+        start = 0
 
-        chunks, start = [], 0
         while start < len(text):
-            end = min(start + CHUNK_SIZE, len(text))
-            chunks.append(text[start:end])
+            end   = min(start + CHUNK_SIZE, len(text))
+            piece = text[start:end]
+
+            # Track the latest page header seen before this chunk
+            for m in page_pattern.finditer(text, 0, end):
+                current_page = m.group()
+
+            chunks.append(Chunk(piece, source, current_page))
             if end >= len(text):
                 break
             start += CHUNK_SIZE - CHUNK_OVERLAP
 
-        scored = []
-        for chunk in chunks:
-            c_cjk   = {c for c in chunk if "\u4e00" <= c <= "\u9fff"}
-            c_latin = set(re.findall(r"[a-zA-Z0-9]+", chunk.lower()))
-            cjk_s   = len(q_cjk   & c_cjk)   / max(len(q_cjk),   1)
-            lat_s   = len(q_latin & c_latin) / max(len(q_latin), 1)
-            scored.append((chunk, max(cjk_s, lat_s)))
+        return chunks
 
-        return sorted(scored, key=lambda x: x[1], reverse=True)
+    def build_index(
+        self,
+        progress_callback=None,
+    ) -> int:
+        """
+        (Re-)build the full-text chunk index from all PDFs in the repo.
 
-    # ── AI helpers ─────────────────────────────────────────────────────────────
+        progress_callback(current, total, filename) is called for each PDF
+        if provided — useful for driving a Streamlit progress bar.
 
-    def find_relevant_pdfs(self, question: str, pdf_list: list[dict]) -> list[dict]:
-        """Ask Qwen which PDFs are most relevant; fall back to keyword matching."""
-        if not pdf_list:
-            return []
+        Returns the total number of chunks indexed.
+        """
+        self._chunk_index.clear()
+        self._indexed_pdfs.clear()
+
+        pdfs  = self.get_pdf_list()
+        total = len(pdfs)
+
+        for i, pdf in enumerate(pdfs):
+            if progress_callback:
+                progress_callback(i, total, pdf["name"])
+
+            text = self.extract_pdf_text(pdf)
+            is_unreadable = (
+                text.startswith("[無法讀取")
+                or ("無法提取文字" in text)
+            )
+            if not is_unreadable:
+                self._chunk_index.extend(self._make_chunks(text, pdf["name"]))
+                self._indexed_pdfs.add(pdf["name"])
+
+        if progress_callback:
+            progress_callback(total, total, "完成")
+
+        return len(self._chunk_index)
+
+    def _score_chunk(self, chunk: Chunk, q_cjk: set, q_latin: set) -> float:
+        """Return a relevance score [0, 1] for a chunk against a query."""
+        if q_cjk:
+            cjk_score = len(q_cjk & chunk.tokens_cjk) / len(q_cjk)
+        else:
+            cjk_score = 0.0
+        if q_latin:
+            lat_score = len(q_latin & chunk.tokens_latin) / len(q_latin)
+        else:
+            lat_score = 0.0
+        return max(cjk_score, lat_score)
+
+    def search_index(self, query: str, top_k: int = TOP_K_CHUNKS) -> list[Chunk]:
+        """
+        Search the chunk index for the most relevant chunks.
+        Returns up to top_k chunks sorted by relevance score (best first).
+        """
+        q_cjk   = {c for c in query if "\u4e00" <= c <= "\u9fff"}
+        q_latin = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
+
+        scored = [
+            (chunk, self._score_chunk(chunk, q_cjk, q_latin))
+            for chunk in self._chunk_index
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Deduplicate: keep at most 2 chunks per source file so a single
+        # large PDF does not crowd out all others.
+        seen_sources: dict[str, int] = {}
+        results: list[Chunk] = []
+        for chunk, score in scored:
+            if score <= 0:
+                break
+            count = seen_sources.get(chunk.source, 0)
+            if count < 2:
+                results.append(chunk)
+                seen_sources[chunk.source] = count + 1
+            if len(results) >= top_k:
+                break
+
+        return results
+
+    # ── Fallback: filename-based search (used when index not built) ────────────
+
+    def _find_pdfs_by_filename(self, question: str, pdf_list: list[dict]) -> list[dict]:
+        """
+        Ask Qwen which PDFs are relevant based on filenames only.
+        Falls back to keyword overlap on filenames if AI call fails.
+        Used only when the full-text index has not been built yet.
+        """
         if len(pdf_list) == 1:
             return pdf_list
 
         names_str = "\n".join(f"- {p['name']}" for p in pdf_list)
-
         try:
             resp = self.client.chat.completions.create(
                 model=self.model,
@@ -188,7 +289,7 @@ class SchoolChatbot:
                 if relevant:
                     return relevant
         except Exception:
-            pass  # fall through to keyword fallback
+            pass
 
         # Keyword fallback on filenames
         q_cjk   = {c for c in question if "\u4e00" <= c <= "\u9fff"}
@@ -201,7 +302,7 @@ class SchoolChatbot:
             scored.append((p, score))
         scored.sort(key=lambda x: x[1], reverse=True)
         top = [p for p, s in scored[:3] if s > 0]
-        return top if top else [pdf_list[0]]
+        return top if top else pdf_list[:3]
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -211,47 +312,92 @@ class SchoolChatbot:
         chat_history: Optional[list[dict]] = None,
     ) -> tuple[str, list[str]]:
         """
-        Answer a question using relevant PDFs as grounding context.
+        Answer a question using relevant PDF content as grounding context.
+
+        Strategy:
+          • If the full-text index has been built → search_index() to find the
+            best chunks across ALL PDFs regardless of filename.
+          • Otherwise → fallback to filename-based PDF selection, then chunk
+            just the selected PDFs on the fly.
+
         Returns (answer_text, [source_filenames]).
         """
         pdf_list = self.get_pdf_list()
         if not pdf_list:
             return "目前倉庫中沒有 PDF 文件，請先上傳相關文件到 GitHub。", []
 
-        # Step 1: identify relevant PDFs
-        relevant = self.find_relevant_pdfs(question, pdf_list)
-
-        # Step 2: extract and chunk text
         context_parts: list[str] = []
         source_files:  list[str] = []
 
-        for pdf in relevant:
-            text = self.extract_pdf_text(pdf)
-            if text.startswith("[無法讀取") or text.startswith("[") and "無法" in text:
-                continue
-            top_chunks = [c for c, _ in self._rank_chunks(question, text)[:MAX_CHUNKS]]
-            snippet    = "\n…\n".join(top_chunks)[:MAX_CTX_PER_PDF]
-            context_parts.append(f"【{pdf['name']}】\n{snippet}")
-            source_files.append(pdf["name"])
+        # ── Path A: full-text index ────────────────────────────────────────────
+        if self.index_ready:
+            top_chunks = self.search_index(question, top_k=TOP_K_CHUNKS)
 
-        if not context_parts:
-            context_parts = ["（相關文件未能提取文字，可能為掃描圖片版）"]
+            if not top_chunks:
+                context_parts = ["（索引中未找到相關內容，請確認文件已正確載入）"]
+            else:
+                # Group chunks by source for a readable prompt layout
+                groups: dict[str, list[Chunk]] = {}
+                for chunk in top_chunks:
+                    groups.setdefault(chunk.source, []).append(chunk)
+
+                total_chars = 0
+                for fname, chunks in groups.items():
+                    if total_chars >= MAX_CTX_CHARS:
+                        break
+                    lines = []
+                    for ch in chunks:
+                        prefix = f"{ch.page_hint} " if ch.page_hint else ""
+                        lines.append(prefix + ch.text)
+                        total_chars += len(ch.text)
+                        if total_chars >= MAX_CTX_CHARS:
+                            break
+                    context_parts.append(f"【{fname}】\n" + "\n…\n".join(lines))
+                    source_files.append(fname)
+
+        # ── Path B: no index — on-the-fly filename search ──────────────────────
+        else:
+            relevant = self._find_pdfs_by_filename(question, pdf_list)
+            for pdf in relevant:
+                text = self.extract_pdf_text(pdf)
+                is_unreadable = (
+                    text.startswith("[無法讀取")
+                    or "無法提取文字" in text
+                )
+                if is_unreadable:
+                    continue
+
+                # Quick chunk + rank on the fly (old behaviour)
+                q_cjk   = {c for c in question if "\u4e00" <= c <= "\u9fff"}
+                q_latin = set(re.findall(r"[a-zA-Z0-9]+", question.lower()))
+                ch_list = self._make_chunks(text, pdf["name"])
+                scored  = sorted(
+                    ch_list,
+                    key=lambda c: self._score_chunk(c, q_cjk, q_latin),
+                    reverse=True,
+                )
+                top3    = scored[:3]
+                snippet = "\n…\n".join(c.text for c in top3)[:4500]
+                context_parts.append(f"【{pdf['name']}】\n{snippet}")
+                source_files.append(pdf["name"])
+
+            if not context_parts:
+                context_parts = ["（相關文件未能提取文字，可能為掃描圖片版）"]
 
         context = ("\n\n" + "─" * 40 + "\n\n").join(context_parts)
 
-        # Step 3: build prompt
+        # ── Build prompt ───────────────────────────────────────────────────────
         system_msg = (
             "你是一位專業的學校事務助手，根據學校官方 PDF 文件回答問題。\n"
             "規則：\n"
             "• 只根據所提供的文件內容回答，不可憑空猜測。\n"
             "• 使用繁體中文，語氣親切、專業。\n"
             "• 若文件中找不到答案，請如實說明，並建議聯絡學校查詢。\n"
-            "• 回答需條理清晰，適當使用列表或分段。"
+            "• 回答需條理清晰，適當使用列表或分段。\n"
+            "• 如有引用，請說明出自哪個文件及頁數。"
         )
 
         messages: list[dict] = [{"role": "system", "content": system_msg}]
-
-        # Include recent conversation turns for context
         if chat_history:
             for msg in chat_history[-6:]:
                 messages.append({"role": msg["role"], "content": msg["content"]})
