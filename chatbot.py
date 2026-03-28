@@ -1,7 +1,7 @@
 """
 School Affairs Chatbot — Core Logic (RAG)
 Strategy:
-  1. On startup: download ALL PDFs, split into large overlapping chunks,
+  1. On startup: download ALL Word docs, split into large overlapping chunks,
      build an in-memory keyword index (full-text, not just summaries).
   2. Per query: score every chunk by CJK character + Latin word overlap;
      pick the top-K most relevant chunks from across all documents.
@@ -14,7 +14,7 @@ import base64
 import requests
 from typing import Optional
 from openai import OpenAI
-import pypdf
+from docx import Document as DocxDocument
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 QWEN_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
@@ -59,17 +59,17 @@ class SchoolChatbot:
         self.github_token = github_token
         self.model        = model
 
-        self._pdf_text_cache: dict[str, str]       = {}
-        self._pdf_list_cache: Optional[list[dict]] = None
-        self._uploaded_pdfs:  set[str]             = set()
+        self._doc_text_cache: dict[str, str]       = {}
+        self._doc_list_cache: Optional[list[dict]] = None
+        self._uploaded_docs:  set[str]             = set()
         self._chunk_index:    list[Chunk]           = []
-        self._indexed_pdfs:   set[str]             = set()
+        self._indexed_docs:   set[str]             = set()
 
     # ── Properties ─────────────────────────────────────────────────────────────
 
     @property
     def has_content(self) -> bool:
-        return bool(self._pdf_list_cache or self._uploaded_pdfs)
+        return bool(self._doc_list_cache or self._uploaded_docs)
 
     @property
     def index_ready(self) -> bool:
@@ -83,9 +83,9 @@ class SchoolChatbot:
             h["Authorization"] = f"token {self.github_token}"
         return h
 
-    def get_pdf_list(self, force_refresh: bool = False) -> list[dict]:
-        if self._pdf_list_cache is not None and not force_refresh:
-            return self._pdf_list_cache
+    def get_doc_list(self, force_refresh: bool = False) -> list[dict]:
+        if self._doc_list_cache is not None and not force_refresh:
+            return self._doc_list_cache
 
         path = self.github_path or ""
         url  = f"https://api.github.com/repos/{self.github_repo}/contents/{path}"
@@ -104,9 +104,9 @@ class SchoolChatbot:
 
         items = resp.json()
         if not isinstance(items, list):
-            raise ChatbotError("指定路徑不是目錄，請確認 PDF 文件夾路徑")
+            raise ChatbotError("指定路徑不是目錄，請確認文件夾路徑")
 
-        self._pdf_list_cache = [
+        self._doc_list_cache = [
             {
                 "name":         item["name"],
                 "download_url": item["download_url"],
@@ -114,11 +114,11 @@ class SchoolChatbot:
                 "size":         item.get("size", 0),
             }
             for item in items
-            if item.get("type") == "file" and item["name"].lower().endswith(".pdf")
+            if item.get("type") == "file" and item["name"].lower().endswith(".docx")
         ]
-        return self._pdf_list_cache
+        return self._doc_list_cache
 
-    def push_pdf_to_github(self, filename: str, data: bytes) -> str:
+    def push_doc_to_github(self, filename: str, data: bytes) -> str:
         if not self.github_repo:
             raise ChatbotError("未設定 GitHub 倉庫，無法儲存文件")
         if not self.github_token:
@@ -134,7 +134,7 @@ class SchoolChatbot:
             sha = check.json().get("sha")
 
         payload: dict = {
-            "message": f"上傳 PDF：{filename}",
+            "message": f"上傳文件：{filename}",
             "content": base64.b64encode(data).decode(),
         }
         if sha:
@@ -142,7 +142,7 @@ class SchoolChatbot:
 
         resp = requests.put(api_url, headers=headers, json=payload, timeout=30)
         if resp.status_code in (200, 201):
-            self._pdf_list_cache = None
+            self._doc_list_cache = None
             return resp.json().get("content", {}).get("html_url", "")
         elif resp.status_code == 401:
             raise ChatbotError("GitHub Token 無效或已過期，請重新填寫")
@@ -153,30 +153,36 @@ class SchoolChatbot:
                 f"上傳失敗（{resp.status_code}）：{resp.json().get('message', resp.text[:200])}"
             )
 
-    # ── PDF extraction ─────────────────────────────────────────────────────────
+    # ── Word extraction ──────────────────────────────────────────────────────
 
-    def _extract_text(self, pdf: dict) -> str:
-        """Download a PDF and return its full extracted text. Result is cached."""
-        name = pdf["name"]
-        if name in self._pdf_text_cache:
-            return self._pdf_text_cache[name]
+    def _extract_text(self, doc: dict) -> str:
+        """Download a .docx file and return its full extracted text. Result is cached."""
+        name = doc["name"]
+        if name in self._doc_text_cache:
+            return self._doc_text_cache[name]
 
         try:
-            resp = requests.get(pdf["download_url"], timeout=30)
+            resp = requests.get(doc["download_url"], timeout=30)
             resp.raise_for_status()
-            reader = pypdf.PdfReader(io.BytesIO(resp.content))
-            pages  = []
-            for i, page in enumerate(reader.pages):
-                text = page.extract_text() or ""
-                if text.strip():
-                    pages.append(f"[第 {i + 1} 頁]\n{text.strip()}")
-            result = "\n\n".join(pages)
+            document = DocxDocument(io.BytesIO(resp.content))
+            paragraphs = []
+            for para in document.paragraphs:
+                t = para.text.strip()
+                if t:
+                    paragraphs.append(t)
+            # Also extract text from tables
+            for table in document.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        paragraphs.append(" | ".join(cells))
+            result = "\n".join(paragraphs)
             if not result.strip():
-                result = f"[{name} 無法提取文字，可能為掃描圖片版本]"
+                result = f"[{name} 無法提取文字]"
         except Exception as e:
             result = f"[無法讀取 {name}：{e}]"
 
-        self._pdf_text_cache[name] = result
+        self._doc_text_cache[name] = result
         return result
 
     # ── Chunk index ────────────────────────────────────────────────────────────
@@ -199,23 +205,23 @@ class SchoolChatbot:
 
     def build_index(self, progress_callback=None) -> int:
         """
-        Download every PDF from GitHub, extract full text, build chunk index.
+        Download every Word doc from GitHub, extract full text, build chunk index.
         Call once on startup; queries will be fast thereafter.
         progress_callback(done, total, filename) — optional UI progress hook.
         """
         self._chunk_index.clear()
-        self._indexed_pdfs.clear()
+        self._indexed_docs.clear()
 
-        pdfs  = self.get_pdf_list(force_refresh=True)
-        total = len(pdfs)
+        docs  = self.get_doc_list(force_refresh=True)
+        total = len(docs)
 
-        for i, pdf in enumerate(pdfs):
+        for i, doc in enumerate(docs):
             if progress_callback:
-                progress_callback(i, total, pdf["name"])
-            text = self._extract_text(pdf)
+                progress_callback(i, total, doc["name"])
+            text = self._extract_text(doc)
             if not text.startswith("[無法") and "無法提取文字" not in text:
-                self._chunk_index.extend(self._make_chunks(text, pdf["name"]))
-                self._indexed_pdfs.add(pdf["name"])
+                self._chunk_index.extend(self._make_chunks(text, doc["name"]))
+                self._indexed_docs.add(doc["name"])
 
         if progress_callback:
             progress_callback(total, total, "完成")
@@ -246,25 +252,30 @@ class SchoolChatbot:
                 break
         return results
 
-    # ── PDF upload ─────────────────────────────────────────────────────────────
+    # ── Word upload ────────────────────────────────────────────────────────────
 
-    def ingest_uploaded_pdf(self, name: str, data: bytes) -> int:
-        """Extract text from an uploaded PDF and add to the chunk index."""
+    def ingest_uploaded_doc(self, name: str, data: bytes) -> int:
+        """Extract text from an uploaded .docx file and add to the chunk index."""
         try:
-            reader = pypdf.PdfReader(io.BytesIO(data))
-            pages  = []
-            for i, page in enumerate(reader.pages):
-                text = page.extract_text() or ""
-                if text.strip():
-                    pages.append(f"[第 {i + 1} 頁]\n{text.strip()}")
-            text = "\n\n".join(pages)
+            document   = DocxDocument(io.BytesIO(data))
+            paragraphs = []
+            for para in document.paragraphs:
+                t = para.text.strip()
+                if t:
+                    paragraphs.append(t)
+            for table in document.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        paragraphs.append(" | ".join(cells))
+            text = "\n".join(paragraphs)
             if not text.strip():
-                text = f"[{name} 無法提取文字，可能為掃描圖片版本]"
+                text = f"[{name} 無法提取文字]"
         except Exception as e:
             text = f"[無法讀取 {name}：{e}]"
 
-        self._pdf_text_cache[name] = text
-        self._uploaded_pdfs.add(name)
+        self._doc_text_cache[name] = text
+        self._uploaded_docs.add(name)
 
         # Remove stale chunks for this file then add fresh ones
         self._chunk_index = [c for c in self._chunk_index if c.source != name]
@@ -284,9 +295,9 @@ class SchoolChatbot:
         """
         Answer a question using top-K chunks from the full-text index.
         """
-        pdf_list = self.get_pdf_list() if self.github_repo else []
-        if not pdf_list and not self._uploaded_pdfs:
-            return "目前沒有任何 PDF 文件可供查閱，請上傳文件或設定 GitHub 倉庫。", []
+        doc_list = self.get_doc_list() if self.github_repo else []
+        if not doc_list and not self._uploaded_docs:
+            return "目前沒有任何文件可供查閱，請管理員上傳 Word 文件或設定 GitHub 倉庫。", []
 
         context_parts: list[str] = []
         source_files:  list[str] = []

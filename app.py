@@ -31,7 +31,7 @@ st.set_page_config(
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🏫 學校事務助手")
-    st.caption("School Affairs PDF Chatbot · Powered by Qwen")
+    st.caption("School Affairs Word Chatbot · Powered by Qwen")
     st.divider()
 
     qwen_api_key = _secret("QWEN_API_KEY")
@@ -41,26 +41,35 @@ with st.sidebar:
     github_token = _secret("GITHUB_TOKEN")
 
     st.divider()
-    st.subheader("📤 上載 PDF 文件")
-    uploaded_files = st.file_uploader(
-        "直接拖放 PDF（可多選）",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="上載後加入索引即可提問。開啟「儲存到 GitHub」則永久保存。",
-        key="pdf_uploader",
-    )
-    if uploaded_files:
-        upload_btn = st.button(
-            f"➕ 加入索引（{len(uploaded_files)} 個檔案）",
-            use_container_width=True,
-        )
-    else:
-        upload_btn = False
+    with st.expander("🔐 管理員上載文件", expanded=False):
+        admin_input = st.text_input("密碼", type="password", key="admin_pw")
+        admin_ok    = (admin_input == "ktps")
+        if admin_input and not admin_ok:
+            st.error("密碼錯誤")
+        if admin_ok:
+            st.success("管理員已登入 ✅")
+            uploaded_files = st.file_uploader(
+                "直接拖放 Word 文件（可多選）",
+                type=["docx"],
+                accept_multiple_files=True,
+                help="上載後加入索引即可提問。",
+                key="doc_uploader",
+            )
+            if uploaded_files:
+                upload_btn = st.button(
+                    f"➕ 加入索引（{len(uploaded_files)} 個檔案）",
+                    use_container_width=True,
+                )
+            else:
+                upload_btn = False
+        else:
+            uploaded_files = []
+            upload_btn     = False
 
     # Show already-indexed uploaded files
-    if st.session_state.get("uploaded_pdf_names"):
-        st.caption(f"📁 已上載 {len(st.session_state.uploaded_pdf_names)} 個檔案：")
-        for n in st.session_state.uploaded_pdf_names:
+    if st.session_state.get("uploaded_doc_names"):
+        st.caption(f"📁 已上傳 {len(st.session_state.uploaded_doc_names)} 個檔案：")
+        for n in st.session_state.uploaded_doc_names:
             st.caption(f"   📄 {n}")
 
     st.divider()
@@ -68,21 +77,21 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         load_btn = st.button("🔄 重新整理", use_container_width=True,
-                         help="重新取得 PDF 列表")
+                         help="重新取得文件列表並重建索引")
     with col2:
         clear_btn = st.button("🗑️ 清除對話", use_container_width=True)
 
     # Show index status
     if st.session_state.get("chunk_count"):
         st.success(f"✅ 索引完成：{st.session_state.chunk_count} 個片段")
-    # Show loaded PDF list
-    if "pdf_list" in st.session_state and st.session_state.pdf_list:
+    # Show loaded doc list
+    if "doc_list" in st.session_state and st.session_state.doc_list:
         st.divider()
-        pdfs = st.session_state.pdf_list
-        st.caption(f"**已載入 {len(pdfs)} 個 PDF 文件**")
-        for pdf in pdfs:
-            kb = pdf["size"] // 1024 if pdf["size"] >= 1024 else "< 1"
-            st.markdown(f"📄 `{pdf['name']}`  *({kb} KB)*")
+        docs = st.session_state.doc_list
+        st.caption(f"**已載入 {len(docs)} 個 Word 文件**")
+        for doc in docs:
+            kb = doc["size"] // 1024 if doc["size"] >= 1024 else "< 1"
+            st.markdown(f"📝 `{doc['name']}`  *({kb} KB)*")
 
 
 # ── Session state init ─────────────────────────────────────────────────────────
@@ -105,7 +114,7 @@ def get_chatbot() -> SchoolChatbot:
             model=qwen_model,
         )
         st.session_state.chatbot_cfg_key = cfg_key
-        st.session_state.pop("pdf_list", None)
+        st.session_state.pop("doc_list", None)
     return st.session_state.chatbot
 
 
@@ -117,9 +126,9 @@ if qwen_api_key and github_repo and not st.session_state.get("init_attempted"):
         _prog = st.progress(0, text="⏳ 正在下載並建立全文索引，請稍候…")
     try:
         _bot  = get_chatbot()
-        _pdfs = _bot.get_pdf_list(force_refresh=True)
-        st.session_state.pdf_list = _pdfs
-        _total = len(_pdfs)
+        _docs = _bot.get_doc_list(force_refresh=True)
+        st.session_state.doc_list = _docs
+        _total = len(_docs)
 
         def _cb(done, total, name):
             pct = int(done / total * 100) if total else 100
@@ -141,8 +150,8 @@ if load_btn:
     else:
         try:
             bot  = get_chatbot()
-            pdfs = bot.get_pdf_list(force_refresh=True)
-            st.session_state.pdf_list       = pdfs
+            docs = bot.get_doc_list(force_refresh=True)
+            st.session_state.doc_list       = docs
             st.session_state.init_attempted = True
             with st.sidebar:
                 _rp = st.progress(0, text="🔄 正在重新建立索引…")
@@ -162,7 +171,7 @@ if upload_btn and uploaded_files:
     if not qwen_api_key:
         st.sidebar.error("⚠️ 請先填寫 Qwen API Key")
     else:
-        bot = get_chatbot()
+        bot   = get_chatbot()
         names: list[str] = []
         progress = st.sidebar.progress(0, text="正在處理上傳文件…")
 
@@ -171,29 +180,29 @@ if upload_btn and uploaded_files:
                 int(i / len(uploaded_files) * 100),
                 text=f"正在讀取 {uf.name}…",
             )
-            pdf_bytes = uf.getvalue()
-            bot.ingest_uploaded_pdf(uf.name, pdf_bytes)
+            doc_bytes = uf.getvalue()
+            bot.ingest_uploaded_doc(uf.name, doc_bytes)
             names.append(uf.name)
             # Silently push to GitHub for permanent storage
             if github_repo and github_token:
                 try:
-                    bot.push_pdf_to_github(uf.name, pdf_bytes)
+                    bot.push_doc_to_github(uf.name, doc_bytes)
                 except ChatbotError:
                     pass
 
         progress.empty()
 
-        prev = st.session_state.get("uploaded_pdf_names", [])
-        st.session_state.uploaded_pdf_names = list(dict.fromkeys(prev + names))
+        prev = st.session_state.get("uploaded_doc_names", [])
+        st.session_state.uploaded_doc_names = list(dict.fromkeys(prev + names))
 
-        # Refresh PDF list if files were pushed to GitHub
+        # Refresh doc list if files were pushed to GitHub
         if github_repo and github_token:
             try:
-                st.session_state.pdf_list = bot.get_pdf_list(force_refresh=True)
+                st.session_state.doc_list = bot.get_doc_list(force_refresh=True)
             except Exception:
                 pass
 
-        st.sidebar.success(f"✅ 已加入 {len(names)} 個文件")
+        st.sidebar.success(f"✅ 已上傳並建立索引：{len(names)} 個文件")
         st.rerun()
 
 if clear_btn:
@@ -232,9 +241,9 @@ if prompt := st.chat_input("請輸入您的問題…"):
     if not qwen_api_key:
         st.error("⚠️ 請先在左側填寫 Qwen API Key")
         st.stop()
-    has_uploads = bool(st.session_state.get("uploaded_pdf_names"))
+    has_uploads = bool(st.session_state.get("uploaded_doc_names"))
     if not github_repo and not has_uploads:
-        st.error("⚠️ 請上傳 PDF 文件，或填寫 GitHub 倉庫")
+        st.error("⚠️ 請管理員上傳 Word 文件，或填寫 GitHub 倉庫")
         st.stop()
 
     # Append & display user message immediately
