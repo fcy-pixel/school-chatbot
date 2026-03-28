@@ -184,9 +184,16 @@ if upload_btn and uploaded_files:
                 int(i / len(uploaded_files) * 100),
                 text=f"正在讀取 {uf.name}…",
             )
-            n = bot.ingest_uploaded_pdf(uf.name, uf.getvalue())
+            pdf_bytes = uf.getvalue()
+            n = bot.ingest_uploaded_pdf(uf.name, pdf_bytes)
             total_chunks += n
             names.append(uf.name)
+            # Silently push to GitHub for permanent storage
+            if github_repo and github_token:
+                try:
+                    bot.push_pdf_to_github(uf.name, pdf_bytes)
+                except ChatbotError:
+                    pass
 
         progress.empty()
 
@@ -194,6 +201,13 @@ if upload_btn and uploaded_files:
         st.session_state.uploaded_pdf_names = list(dict.fromkeys(prev + names))
         st.session_state.index_ready = True
         st.session_state.chunk_count = len(bot._chunk_index)
+
+        # Refresh PDF list if files were pushed to GitHub
+        if github_repo and github_token:
+            try:
+                st.session_state.pdf_list = bot.get_pdf_list(force_refresh=True)
+            except Exception:
+                pass
 
         st.sidebar.success(f"✅ 已加入 {len(names)} 個文件，新增 {total_chunks} 個片段")
         st.rerun()
