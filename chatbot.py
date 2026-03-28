@@ -153,6 +153,43 @@ class SchoolChatbot:
                 f"上傳失敗（{resp.status_code}）：{resp.json().get('message', resp.text[:200])}"
             )
 
+    # ── Delete document ──────────────────────────────────────────────────────
+
+    def delete_doc(self, filename: str) -> None:
+        """Remove a document from the in-memory index and from GitHub (if configured)."""
+        # Remove from chunk index and all caches
+        self._chunk_index = [c for c in self._chunk_index if c.source != filename]
+        self._doc_text_cache.pop(filename, None)
+        self._uploaded_docs.discard(filename)
+        self._indexed_docs.discard(filename)
+        if self._doc_list_cache is not None:
+            self._doc_list_cache = [d for d in self._doc_list_cache if d["name"] != filename]
+
+        # Delete from GitHub if configured
+        if not self.github_repo or not self.github_token:
+            return
+        file_path = f"{self.github_path}/{filename}" if self.github_path else filename
+        api_url   = f"https://api.github.com/repos/{self.github_repo}/contents/{file_path}"
+        headers   = {**self._gh_headers(), "Content-Type": "application/json"}
+
+        check = requests.get(api_url, headers=headers, timeout=10)
+        if check.status_code == 404:
+            return  # already gone
+        if check.status_code != 200:
+            raise ChatbotError(f"查詢 GitHub 文件失敗（{check.status_code}）")
+
+        sha  = check.json().get("sha")
+        resp = requests.delete(
+            api_url,
+            headers=headers,
+            json={"message": f"刪除文件：{filename}", "sha": sha},
+            timeout=15,
+        )
+        if not resp.ok:
+            raise ChatbotError(
+                f"GitHub 刪除失敗（{resp.status_code}）：{resp.json().get('message', '')}"
+            )
+
     # ── Word extraction ──────────────────────────────────────────────────────
 
     def _extract_text(self, doc: dict) -> str:

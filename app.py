@@ -69,15 +69,23 @@ with st.sidebar:
                 )
             else:
                 upload_btn = False
+
+            # ── Delete management ──────────────────────────────────────────
+            _gh_docs   = st.session_state.get("doc_list") or []
+            _up_names  = st.session_state.get("uploaded_doc_names") or []
+            _gh_names  = {d["name"] for d in _gh_docs}
+            _all_names = list(_gh_names) + [n for n in _up_names if n not in _gh_names]
+            if _all_names:
+                st.divider()
+                st.caption("📋 管理現有文件")
+                for _dn in _all_names:
+                    _c1, _c2 = st.columns([5, 1])
+                    _c1.caption(f"📄 {_dn}")
+                    if _c2.button("🗑️", key=f"del_{_dn}", help=f"刪除 {_dn}"):
+                        st.session_state.pending_delete = _dn
         else:
             uploaded_files = []
             upload_btn     = False
-
-    # Show already-indexed uploaded files
-    if st.session_state.get("uploaded_doc_names"):
-        st.caption(f"📁 已上傳 {len(st.session_state.uploaded_doc_names)} 個檔案：")
-        for n in st.session_state.uploaded_doc_names:
-            st.caption(f"   📄 {n}")
 
     st.divider()
 
@@ -236,6 +244,27 @@ if upload_btn and uploaded_files:
             for file_name, reason in failed:
                 st.sidebar.caption(f"• {file_name}：{reason}")
         st.rerun()
+
+if st.session_state.get("pending_delete"):
+    _del_name = st.session_state.pop("pending_delete")
+    try:
+        _del_bot = get_chatbot()
+        _del_bot.delete_doc(_del_name)
+        # Remove from session-state lists
+        if "uploaded_doc_names" in st.session_state:
+            st.session_state.uploaded_doc_names = [
+                n for n in st.session_state.uploaded_doc_names if n != _del_name
+            ]
+        if "doc_list" in st.session_state and st.session_state.doc_list:
+            st.session_state.doc_list = [
+                d for d in st.session_state.doc_list if d["name"] != _del_name
+            ]
+        # Recount chunks
+        st.session_state.chunk_count = len(_del_bot._chunk_index)
+        st.sidebar.success(f"✅ 已刪除：{_del_name}")
+    except ChatbotError as _del_err:
+        st.sidebar.error(f"刪除失敗：{_del_err}")
+    st.rerun()
 
 if clear_btn:
     st.session_state.messages = []
