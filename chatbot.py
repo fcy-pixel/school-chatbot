@@ -11,8 +11,9 @@ School Affairs Chatbot — Core Logic
 import io
 import re
 import json
+import base64
 import requests
-from typing import Optional, Generator
+from typing import Optional
 from openai import OpenAI
 import pypdf
 
@@ -122,6 +123,55 @@ class SchoolChatbot:
 
         self._pdf_list_cache = pdfs
         return pdfs
+
+    def push_pdf_to_github(self, filename: str, data: bytes) -> str:
+        """
+        Upload a PDF to the configured GitHub repo+path via the Contents API.
+        Requires github_token with repo write access.
+        Returns the HTML URL of the committed file.
+        Raises ChatbotError on failure.
+        """
+        if not self.github_repo:
+            raise ChatbotError("未設定 GitHub 倉庫，無法儲存文件")
+        if not self.github_token:
+            raise ChatbotError(
+                "需要 GitHub Token（具備 repo 寫入權限）才能儲存文件到倉庫\n"
+                "請在左側填寫 Personal Access Token"
+            )
+
+        file_path = f"{self.github_path}/{filename}" if self.github_path else filename
+        api_url   = f"https://api.github.com/repos/{self.github_repo}/contents/{file_path}"
+        headers   = {**self._gh_headers(), "Content-Type": "application/json"}
+
+        # Check if the file already exists (need its SHA to update)
+        sha: Optional[str] = None
+        check = requests.get(api_url, headers=headers, timeout=10)
+        if check.status_code == 200:
+            sha = check.json().get("sha")
+        elif check.status_code not in (404,):
+            raise ChatbotError(f"GitHub API 錯誤 {check.status_code}：{check.text[:200]}")
+
+        payload: dict = {
+            "message": f"上傳 PDF：{filename}",
+            "content": base64.b64encode(data).decode(),
+        }
+        if sha:
+            payload["sha"] = sha  # required when updating an existing file
+
+        resp = requests.put(api_url, headers=headers, json=payload, timeout=30)
+        if resp.status_code in (200, 201):
+            html_url = resp.json().get("content", {}).get("html_url", "")
+            # Invalidate the cached PDF list so next load picks up the new file
+            self._pdf_list_cache = None
+            return html_url
+        elif resp.status_code == 401:
+            raise ChatbotError("GitHub Token 無效或已過期，請重新填寫")
+        elif resp.status_code == 403:
+            raise ChatbotError("GitHub Token 沒有倉庫寫入權限，需要 repo scope")
+        else:
+            raise ChatbotError(
+                f"上傳失敗（{resp.status_code}）：{resp.json().get('message', resp.text[:200])}"
+            )
 
     # ── PDF text extraction ────────────────────────────────────────────────────
 

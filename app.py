@@ -65,19 +65,25 @@ with st.sidebar:
         help="PDF 文件在倉庫中的目錄路徑，留空代表根目錄",
     )
     github_token = st.text_input(
-        "GitHub Token（私有倉庫才需要）",
+        "GitHub Token",
         value=_secret("GITHUB_TOKEN"),
         type="password",
-        help="私有倉庫請提供 Personal Access Token",
+        help="上載文件到 GitHub 倉庫需要填寫（需 repo 寫入權限）；私有倉庫也需要。",
     )
 
     st.divider()
     st.subheader("📤 上載 PDF 文件")
+    save_to_github = st.toggle(
+        "儲存到 GitHub（下次自動載入）",
+        value=True,
+        help="開啟後上載的 PDF 會自動儲存到 GitHub 倉庫。\n"
+             "需要填寫 GitHub Token（repo 寫入權限）。",
+    )
     uploaded_files = st.file_uploader(
-        "直接上載 PDF（可檔名不反映內容）",
+        "直接拖放 PDF（可多選）",
         type=["pdf"],
         accept_multiple_files=True,
-        help="直接拖放 PDF 即可加入索引。不需要 GitHub 倉庫也能使用。",
+        help="上載後加入索引即可提問。開啟「儲存到 GitHub」則永久保存。",
         key="pdf_uploader",
     )
     if uploaded_files:
@@ -176,27 +182,51 @@ if upload_btn and uploaded_files:
         st.sidebar.error("⚠️ 請先填寫 Qwen API Key")
     else:
         bot = get_chatbot()
-        names = []
+        names: list[str] = []
+        saved_to_gh: list[str] = []
+        failed_gh:   list[str] = []
         progress = st.sidebar.progress(0, text="正在處理上傳文件…")
         total_chunks = 0
+
         for i, uf in enumerate(uploaded_files):
             progress.progress(
-                int((i) / len(uploaded_files) * 100),
+                int(i / len(uploaded_files) * 100),
                 text=f"正在讀取 {uf.name}…",
             )
-            n = bot.ingest_uploaded_pdf(uf.name, uf.getvalue())
+            pdf_bytes = uf.getvalue()
+            n = bot.ingest_uploaded_pdf(uf.name, pdf_bytes)
             total_chunks += n
             names.append(uf.name)
+
+            # Push to GitHub for permanent storage
+            if save_to_github and github_repo and github_token:
+                try:
+                    bot.push_pdf_to_github(uf.name, pdf_bytes)
+                    saved_to_gh.append(uf.name)
+                except ChatbotError as gh_err:
+                    failed_gh.append(f"{uf.name}：{gh_err}")
+
         progress.empty()
 
-        # Merge with any previous uploads
         prev = st.session_state.get("uploaded_pdf_names", [])
         st.session_state.uploaded_pdf_names = list(dict.fromkeys(prev + names))
-        st.session_state.index_ready  = True
-        st.session_state.chunk_count  = len(bot._chunk_index)
-        st.sidebar.success(
-            f"✅ 已加入 {len(names)} 個文件，新增 {total_chunks} 個片段"
-        )
+        st.session_state.index_ready = True
+        st.session_state.chunk_count = len(bot._chunk_index)
+
+        msg = f"✅ 已加入 {len(names)} 個文件，新增 {total_chunks} 個片段"
+        if saved_to_gh:
+            msg += f"\n💾 已永久儲存到 GitHub：{', '.join(saved_to_gh)}"
+        st.sidebar.success(msg)
+        for fe in failed_gh:
+            st.sidebar.warning(f"⚠️ GitHub 儲存失敗 — {fe}")
+
+        # Auto-refresh PDF list if files were saved to GitHub
+        if saved_to_gh and github_repo:
+            try:
+                pdfs = bot.get_pdf_list(force_refresh=True)
+                st.session_state.pdf_list = pdfs
+            except Exception:
+                pass
         st.rerun()
 
 if index_btn:
