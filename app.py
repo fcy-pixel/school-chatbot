@@ -34,42 +34,41 @@ with st.sidebar:
     st.caption("School Affairs PDF Chatbot · Powered by Qwen")
     st.divider()
 
-    st.subheader("🔑 Qwen API 設定")
-    qwen_api_key = st.text_input(
-        "Qwen API Key *",
-        value=_secret("QWEN_API_KEY"),
-        type="password",
-        placeholder="sk-...",
-        help="通義千問國際版 API Key（dashscope-intl）",
-    )
+    with st.expander("🔑 Qwen API 設定", expanded=not bool(_secret("QWEN_API_KEY"))):
+        qwen_api_key = st.text_input(
+            "Qwen API Key *",
+            value=_secret("QWEN_API_KEY"),
+            type="password",
+            placeholder="sk-...",
+            help="通義千問國際版 API Key（dashscope-intl）",
+        )
 
-    qwen_model = st.selectbox(
-        "模型",
-        ["qwen-plus", "qwen-turbo", "qwen-max"],
-        index=0,
-        help="qwen-plus 平衡速度與效果；qwen-max 效果最佳；qwen-turbo 最快",
-    )
+        qwen_model = st.selectbox(
+            "模型",
+            ["qwen-plus", "qwen-turbo", "qwen-max"],
+            index=0,
+            help="qwen-plus 平衡速度與效果；qwen-max 效果最佳；qwen-turbo 最快",
+        )
 
-    st.divider()
-    st.subheader("📁 GitHub PDF 倉庫設定")
-    github_repo = st.text_input(
-        "GitHub 倉庫 *",
-        value=_secret("GITHUB_REPO"),
-        placeholder="username/repository",
-        help="存放學校 PDF 文件的公開 GitHub 倉庫",
-    )
-    github_path = st.text_input(
-        "PDF 所在子目錄",
-        value=_secret("GITHUB_PATH"),
-        placeholder="pdfs/（留空表示根目錄）",
-        help="PDF 文件在倉庫中的目錄路徑，留空代表根目錄",
-    )
-    github_token = st.text_input(
-        "GitHub Token",
-        value=_secret("GITHUB_TOKEN"),
-        type="password",
-        help="上載文件到 GitHub 倉庫需要填寫（需 repo 寫入權限）；私有倉庫也需要。",
-    )
+    with st.expander("📁 GitHub PDF 倉庫設定", expanded=not bool(_secret("GITHUB_REPO"))):
+        github_repo = st.text_input(
+            "GitHub 倉庫 *",
+            value=_secret("GITHUB_REPO"),
+            placeholder="username/repository",
+            help="存放學校 PDF 文件的公開 GitHub 倉庫",
+        )
+        github_path = st.text_input(
+            "PDF 所在子目錄",
+            value=_secret("GITHUB_PATH"),
+            placeholder="pdfs/（留空表示根目錄）",
+            help="PDF 文件在倉庫中的目錄路徑，留空代表根目錄",
+        )
+        github_token = st.text_input(
+            "GitHub Token",
+            value=_secret("GITHUB_TOKEN"),
+            type="password",
+            help="上載文件到 GitHub 倉庫需要填寫（需 repo 寫入權限）；私有倉庫也需要。",
+        )
 
     st.divider()
     st.subheader("📤 上載 PDF 文件")
