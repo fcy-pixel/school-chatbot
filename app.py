@@ -12,6 +12,14 @@ try:
 except ImportError:
     pass
 
+
+def _secret(key: str) -> str:
+    """Read from st.secrets (Streamlit Cloud) first, then os.environ (.env locally)."""
+    try:
+        return st.secrets.get(key, os.getenv(key, ""))
+    except Exception:
+        return os.getenv(key, "")
+
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="學校事務助手",
@@ -29,7 +37,7 @@ with st.sidebar:
     st.subheader("🔑 Qwen API 設定")
     qwen_api_key = st.text_input(
         "Qwen API Key *",
-        value=os.getenv("QWEN_API_KEY", ""),
+        value=_secret("QWEN_API_KEY"),
         type="password",
         placeholder="sk-...",
         help="通義千問國際版 API Key（dashscope-intl）",
@@ -46,19 +54,19 @@ with st.sidebar:
     st.subheader("📁 GitHub PDF 倉庫設定")
     github_repo = st.text_input(
         "GitHub 倉庫 *",
-        value=os.getenv("GITHUB_REPO", ""),
+        value=_secret("GITHUB_REPO"),
         placeholder="username/repository",
         help="存放學校 PDF 文件的公開 GitHub 倉庫",
     )
     github_path = st.text_input(
         "PDF 所在子目錄",
-        value=os.getenv("GITHUB_PATH", ""),
+        value=_secret("GITHUB_PATH"),
         placeholder="pdfs/（留空表示根目錄）",
         help="PDF 文件在倉庫中的目錄路徑，留空代表根目錄",
     )
     github_token = st.text_input(
         "GitHub Token（私有倉庫才需要）",
-        value=os.getenv("GITHUB_TOKEN", ""),
+        value=_secret("GITHUB_TOKEN"),
         type="password",
         help="私有倉庫請提供 Personal Access Token",
     )
