@@ -1,14 +1,15 @@
 """
-School Affairs Chatbot — Core Logic
-- Fetches PDF list from a GitHub repository
-- Selects the most relevant PDFs per question (AI-based, by filename)
-- Reads FULL text of selected PDFs — no chunking, maximum accuracy
-- Uses Qwen (Alibaba Cloud International) to answer questions
+School Affairs Chatbot — Core Logic (RAG)
+Strategy:
+  1. On startup: download ALL PDFs, split into large overlapping chunks,
+     build an in-memory keyword index (full-text, not just summaries).
+  2. Per query: score every chunk by CJK character + Latin word overlap;
+     pick the top-K most relevant chunks from across all documents.
+  3. Send only those chunks to Qwen — accurate and efficient.
 """
 
 import io
 import re
-import json
 import base64
 import requests
 from typing import Optional
@@ -16,14 +17,28 @@ from openai import OpenAI
 import pypdf
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-QWEN_BASE_URL    = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-DEFAULT_MODEL    = "qwen-plus"
-MAX_PDFS_TO_READ = 4        # read at most this many full PDFs per question
-MAX_CTX_CHARS    = 80_000   # total character cap (~50 k tokens)
+QWEN_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+DEFAULT_MODEL  = "qwen-plus"
+CHUNK_SIZE     = 3000   # large chunks = more context per hit
+CHUNK_OVERLAP  = 500    # overlap ensures topics at chunk boundaries are captured
+TOP_K          = 8      # chunks sent to the model per query
+MAX_CTX_CHARS  = 24_000 # hard cap on total context chars sent to model
 
 
 class ChatbotError(Exception):
     pass
+
+
+class Chunk:
+    """A text chunk from a PDF with pre-tokenised keyword sets for fast scoring."""
+    __slots__ = ("text", "source", "page_tag", "tok_cjk", "tok_latin")
+
+    def __init__(self, text: str, source: str, page_tag: str):
+        self.text      = text
+        self.source    = source
+        self.page_tag  = page_tag
+        self.tok_cjk   = {c for c in text if "\u4e00" <= c <= "\u9fff"}
+        self.tok_latin = set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
 
 
 class SchoolChatbot:
@@ -38,21 +53,29 @@ class SchoolChatbot:
         if not qwen_api_key:
             raise ChatbotError("缺少 Qwen API Key")
 
-        self.client = OpenAI(api_key=qwen_api_key, base_url=QWEN_BASE_URL)
+        self.client       = OpenAI(api_key=qwen_api_key, base_url=QWEN_BASE_URL)
         self.github_repo  = github_repo.strip("/") if github_repo else ""
         self.github_path  = github_path.strip("/") if github_path else ""
         self.github_token = github_token
         self.model        = model
 
-        self._pdf_text_cache: dict[str, str] = {}
+        self._pdf_text_cache: dict[str, str]       = {}
         self._pdf_list_cache: Optional[list[dict]] = None
-        self._uploaded_pdfs: set[str] = set()
+        self._uploaded_pdfs:  set[str]             = set()
+        self._chunk_index:    list[Chunk]           = []
+        self._indexed_pdfs:   set[str]             = set()
 
-    # ── GitHub helpers ─────────────────────────────────────────────────────────
+    # ── Properties ─────────────────────────────────────────────────────────────
 
     @property
     def has_content(self) -> bool:
         return bool(self._pdf_list_cache or self._uploaded_pdfs)
+
+    @property
+    def index_ready(self) -> bool:
+        return bool(self._chunk_index)
+
+    # ── GitHub helpers ─────────────────────────────────────────────────────────
 
     def _gh_headers(self) -> dict:
         h = {"Accept": "application/vnd.github.v3+json"}
@@ -61,7 +84,6 @@ class SchoolChatbot:
         return h
 
     def get_pdf_list(self, force_refresh: bool = False) -> list[dict]:
-        """Return list of PDF dicts from the configured GitHub path."""
         if self._pdf_list_cache is not None and not force_refresh:
             return self._pdf_list_cache
 
@@ -84,61 +106,44 @@ class SchoolChatbot:
         if not isinstance(items, list):
             raise ChatbotError("指定路徑不是目錄，請確認 PDF 文件夾路徑")
 
-        pdfs = [
+        self._pdf_list_cache = [
             {
                 "name":         item["name"],
                 "download_url": item["download_url"],
                 "path":         item["path"],
                 "size":         item.get("size", 0),
-                "html_url":     item.get("html_url", ""),
             }
             for item in items
             if item.get("type") == "file" and item["name"].lower().endswith(".pdf")
         ]
-
-        self._pdf_list_cache = pdfs
-        return pdfs
+        return self._pdf_list_cache
 
     def push_pdf_to_github(self, filename: str, data: bytes) -> str:
-        """
-        Upload a PDF to the configured GitHub repo+path via the Contents API.
-        Requires github_token with repo write access.
-        Returns the HTML URL of the committed file.
-        Raises ChatbotError on failure.
-        """
         if not self.github_repo:
             raise ChatbotError("未設定 GitHub 倉庫，無法儲存文件")
         if not self.github_token:
-            raise ChatbotError(
-                "需要 GitHub Token（具備 repo 寫入權限）才能儲存文件到倉庫\n"
-                "請在左側填寫 Personal Access Token"
-            )
+            raise ChatbotError("需要 GitHub Token（具備 repo 寫入權限）才能儲存文件")
 
         file_path = f"{self.github_path}/{filename}" if self.github_path else filename
         api_url   = f"https://api.github.com/repos/{self.github_repo}/contents/{file_path}"
         headers   = {**self._gh_headers(), "Content-Type": "application/json"}
 
-        # Check if the file already exists (need its SHA to update)
         sha: Optional[str] = None
         check = requests.get(api_url, headers=headers, timeout=10)
         if check.status_code == 200:
             sha = check.json().get("sha")
-        elif check.status_code not in (404,):
-            raise ChatbotError(f"GitHub API 錯誤 {check.status_code}：{check.text[:200]}")
 
         payload: dict = {
             "message": f"上傳 PDF：{filename}",
             "content": base64.b64encode(data).decode(),
         }
         if sha:
-            payload["sha"] = sha  # required when updating an existing file
+            payload["sha"] = sha
 
         resp = requests.put(api_url, headers=headers, json=payload, timeout=30)
         if resp.status_code in (200, 201):
-            html_url = resp.json().get("content", {}).get("html_url", "")
-            # Invalidate the cached PDF list so next load picks up the new file
             self._pdf_list_cache = None
-            return html_url
+            return resp.json().get("content", {}).get("html_url", "")
         elif resp.status_code == 401:
             raise ChatbotError("GitHub Token 無效或已過期，請重新填寫")
         elif resp.status_code == 403:
@@ -148,10 +153,10 @@ class SchoolChatbot:
                 f"上傳失敗（{resp.status_code}）：{resp.json().get('message', resp.text[:200])}"
             )
 
-    # ── PDF text extraction ────────────────────────────────────────────────────
+    # ── PDF extraction ─────────────────────────────────────────────────────────
 
-    def extract_pdf_text(self, pdf: dict) -> str:
-        """Download a PDF and return its extracted text (with page headers). Cached."""
+    def _extract_text(self, pdf: dict) -> str:
+        """Download a PDF and return its full extracted text. Result is cached."""
         name = pdf["name"]
         if name in self._pdf_text_cache:
             return self._pdf_text_cache[name]
@@ -174,10 +179,77 @@ class SchoolChatbot:
         self._pdf_text_cache[name] = result
         return result
 
+    # ── Chunk index ────────────────────────────────────────────────────────────
+
+    def _make_chunks(self, text: str, source: str) -> list[Chunk]:
+        page_re      = re.compile(r"\[第\s*\d+\s*頁\]")
+        current_page = ""
+        chunks: list[Chunk] = []
+        start = 0
+        while start < len(text):
+            end   = min(start + CHUNK_SIZE, len(text))
+            piece = text[start:end]
+            for m in page_re.finditer(text, 0, end):
+                current_page = m.group()
+            chunks.append(Chunk(piece, source, current_page))
+            if end >= len(text):
+                break
+            start += CHUNK_SIZE - CHUNK_OVERLAP
+        return chunks
+
+    def build_index(self, progress_callback=None) -> int:
+        """
+        Download every PDF from GitHub, extract full text, build chunk index.
+        Call once on startup; queries will be fast thereafter.
+        progress_callback(done, total, filename) — optional UI progress hook.
+        """
+        self._chunk_index.clear()
+        self._indexed_pdfs.clear()
+
+        pdfs  = self.get_pdf_list(force_refresh=True)
+        total = len(pdfs)
+
+        for i, pdf in enumerate(pdfs):
+            if progress_callback:
+                progress_callback(i, total, pdf["name"])
+            text = self._extract_text(pdf)
+            if not text.startswith("[無法") and "無法提取文字" not in text:
+                self._chunk_index.extend(self._make_chunks(text, pdf["name"]))
+                self._indexed_pdfs.add(pdf["name"])
+
+        if progress_callback:
+            progress_callback(total, total, "完成")
+        return len(self._chunk_index)
+
+    def _score_chunk(self, chunk: Chunk, q_cjk: set, q_latin: set) -> float:
+        cjk = len(q_cjk & chunk.tok_cjk)    / len(q_cjk)   if q_cjk   else 0.0
+        lat = len(q_latin & chunk.tok_latin) / len(q_latin) if q_latin else 0.0
+        return max(cjk, lat)
+
+    def search_index(self, query: str) -> list[Chunk]:
+        """Return the top-K most relevant chunks for the given query."""
+        q_cjk   = {c for c in query if "\u4e00" <= c <= "\u9fff"}
+        q_latin = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))
+        scored  = sorted(
+            ((c, self._score_chunk(c, q_cjk, q_latin)) for c in self._chunk_index),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        results: list[Chunk] = []
+        total_chars = 0
+        for chunk, score in scored:
+            if score <= 0 or total_chars >= MAX_CTX_CHARS:
+                break
+            results.append(chunk)
+            total_chars += len(chunk.text)
+            if len(results) >= TOP_K:
+                break
+        return results
+
     # ── PDF upload ─────────────────────────────────────────────────────────────
 
-    def ingest_uploaded_pdf(self, name: str, data: bytes) -> None:
-        """Add a user-uploaded PDF (raw bytes) to the text cache."""
+    def ingest_uploaded_pdf(self, name: str, data: bytes) -> int:
+        """Extract text from an uploaded PDF and add to the chunk index."""
         try:
             reader = pypdf.PdfReader(io.BytesIO(data))
             pages  = []
@@ -194,62 +266,15 @@ class SchoolChatbot:
         self._pdf_text_cache[name] = text
         self._uploaded_pdfs.add(name)
 
-    # ── PDF selection ──────────────────────────────────────────────────────────
+        # Remove stale chunks for this file then add fresh ones
+        self._chunk_index = [c for c in self._chunk_index if c.source != name]
+        if not text.startswith("[無法") and "無法提取文字" not in text:
+            new_chunks = self._make_chunks(text, name)
+            self._chunk_index.extend(new_chunks)
+            return len(new_chunks)
+        return 0
 
-    def _select_pdfs(self, question: str, pdf_list: list[dict]) -> list[dict]:
-        """
-        Ask Qwen which PDFs are most relevant to the question (by filename).
-        Falls back to keyword overlap if AI call fails.
-        Returns at most MAX_PDFS_TO_READ entries.
-        """
-        if len(pdf_list) <= MAX_PDFS_TO_READ:
-            return pdf_list
-
-        names_str = "\n".join(f"- {p['name']}" for p in pdf_list)
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是學校文件分析助手。根據用戶問題，從以下 PDF 文件列表中選出"
-                            f"最相關的文件（最多 {MAX_PDFS_TO_READ} 個）。"
-                            '只返回 JSON 格式，不要其他文字：{"files": ["filename.pdf", ...]}'
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": f"問題：{question}\n\n可用文件：\n{names_str}",
-                    },
-                ],
-                max_tokens=300,
-                temperature=0.1,
-            )
-            content = resp.choices[0].message.content.strip()
-            match = re.search(r'\{[^{}]*"files"[^{}]*\}', content, re.DOTALL)
-            if match:
-                selected = json.loads(match.group()).get("files", [])
-                relevant = [p for p in pdf_list if p["name"] in selected]
-                if relevant:
-                    return relevant[:MAX_PDFS_TO_READ]
-        except Exception:
-            pass
-
-        # Keyword fallback on filenames
-        q_cjk   = {c for c in question if "\u4e00" <= c <= "\u9fff"}
-        q_latin = set(re.findall(r"[a-zA-Z0-9]+", question.lower()))
-        scored  = []
-        for p in pdf_list:
-            n_cjk   = {c for c in p["name"] if "\u4e00" <= c <= "\u9fff"}
-            n_latin = set(re.findall(r"[a-zA-Z0-9]+", p["name"].lower()))
-            score   = len(q_cjk & n_cjk) + len(q_latin & n_latin)
-            scored.append((p, score))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top = [p for p, s in scored[:MAX_PDFS_TO_READ] if s > 0]
-        return top if top else pdf_list[:MAX_PDFS_TO_READ]
-
-    # ── Public API ─────────────────────────────────────────────────────────────
+    # ── Public chat API ────────────────────────────────────────────────────────
 
     def chat(
         self,
@@ -257,49 +282,34 @@ class SchoolChatbot:
         chat_history: Optional[list[dict]] = None,
     ) -> tuple[str, list[str]]:
         """
-        Answer a question by reading the FULL text of the most relevant PDFs.
-        No pre-built index — every query reads complete documents for max accuracy.
+        Answer a question using top-K chunks from the full-text index.
         """
         pdf_list = self.get_pdf_list() if self.github_repo else []
-
-        # Build combined entry list: uploaded PDFs + GitHub PDFs
-        all_entries: list[dict] = []
-        for name in self._uploaded_pdfs:
-            all_entries.append({"name": name, "_cached": True})
-        for p in pdf_list:
-            if p["name"] not in self._uploaded_pdfs:
-                all_entries.append(p)
-
-        if not all_entries:
+        if not pdf_list and not self._uploaded_pdfs:
             return "目前沒有任何 PDF 文件可供查閱，請上傳文件或設定 GitHub 倉庫。", []
-
-        # Select the most relevant PDFs by filename
-        relevant = self._select_pdfs(question, all_entries)
 
         context_parts: list[str] = []
         source_files:  list[str] = []
-        total_chars = 0
 
-        for pdf in relevant:
-            if total_chars >= MAX_CTX_CHARS:
-                break
-            name = pdf["name"]
-            if pdf.get("_cached") or name in self._pdf_text_cache:
-                text = self._pdf_text_cache.get(name, "")
+        if self.index_ready:
+            top_chunks = self.search_index(question)
+            if not top_chunks:
+                context_parts = ["（索引中未找到相關內容，請嘗試換不同詞語提問）"]
             else:
-                text = self.extract_pdf_text(pdf)
-
-            if "無法提取文字" in text or text.startswith("[無法讀取"):
-                continue
-
-            remaining = MAX_CTX_CHARS - total_chars
-            trimmed   = text[:remaining]
-            context_parts.append(f"【{name}】\n{trimmed}")
-            source_files.append(name)
-            total_chars += len(trimmed)
-
-        if not context_parts:
-            context_parts = ["（相關文件未能提取文字，可能為掃描圖片版）"]
+                groups: dict[str, list[Chunk]] = {}
+                for c in top_chunks:
+                    groups.setdefault(c.source, []).append(c)
+                for fname, chunks in groups.items():
+                    sections = [
+                        f"{c.page_tag}\n{c.text}" if c.page_tag else c.text
+                        for c in chunks
+                    ]
+                    context_parts.append(
+                        f"【{fname}】\n" + "\n…\n".join(sections)
+                    )
+                    source_files.append(fname)
+        else:
+            context_parts = ["（索引尚未建立，請稍候或點擊「重新整理」）"]
 
         context = ("\n\n" + "─" * 40 + "\n\n").join(context_parts)
 
@@ -323,7 +333,7 @@ class SchoolChatbot:
         })
 
         try:
-            resp   = self.client.chat.completions.create(
+            resp = self.client.chat.completions.create(
                 model=self.model, messages=messages, max_tokens=2000, temperature=0.7
             )
             return resp.choices[0].message.content, source_files

@@ -72,6 +72,9 @@ with st.sidebar:
     with col2:
         clear_btn = st.button("🗑️ 清除對話", use_container_width=True)
 
+    # Show index status
+    if st.session_state.get("chunk_count"):
+        st.success(f"✅ 索引完成：{st.session_state.chunk_count} 個片段")
     # Show loaded PDF list
     if "pdf_list" in st.session_state and st.session_state.pdf_list:
         st.divider()
@@ -106,16 +109,25 @@ def get_chatbot() -> SchoolChatbot:
     return st.session_state.chatbot
 
 
-# ── Auto-init: load PDF list on first visit ───────────────────────────────────
+# ── Auto-init: build full-text chunk index on first visit ───────────────────────
 if qwen_api_key and github_repo and not st.session_state.get("init_attempted"):
     st.session_state.init_attempted = True
     _placeholder = st.empty()
     with _placeholder.container():
-        st.info("⏳ 正在從 GitHub 載入 PDF 列表，請稍候…")
+        _prog = st.progress(0, text="⏳ 正在下載並建立全文索引，請稍候…")
     try:
-        _bot = get_chatbot()
+        _bot  = get_chatbot()
         _pdfs = _bot.get_pdf_list(force_refresh=True)
         st.session_state.pdf_list = _pdfs
+        _total = len(_pdfs)
+
+        def _cb(done, total, name):
+            pct = int(done / total * 100) if total else 100
+            _prog.progress(pct, text=f"📥 正在索引 {done}/{total}：{name}")
+
+        if _total > 0:
+            n_chunks = _bot.build_index(progress_callback=_cb)
+            st.session_state.chunk_count = n_chunks
     except ChatbotError as _e:
         _placeholder.error(f"⚠️ 初始化失敗：{_e}")
     else:
@@ -132,6 +144,16 @@ if load_btn:
             pdfs = bot.get_pdf_list(force_refresh=True)
             st.session_state.pdf_list       = pdfs
             st.session_state.init_attempted = True
+            with st.sidebar:
+                _rp = st.progress(0, text="🔄 正在重新建立索引…")
+
+            def _rcb(done, total, name):
+                pct = int(done / total * 100) if total else 100
+                _rp.progress(pct, text=f"📥 {done}/{total}：{name}")
+
+            n_chunks = bot.build_index(progress_callback=_rcb)
+            st.session_state.chunk_count = n_chunks
+            _rp.empty()
         except ChatbotError as e:
             st.sidebar.error(str(e))
         st.rerun()
@@ -186,7 +208,7 @@ if not st.session_state.messages:
     if st.session_state.get("init_attempted"):
         st.info(
             "👋 **歡迎使用學校事務助手！**\n\n"
-            "直接在下方輸入問題，系統會自動選取相關文件並閱讀全文來回答。"
+            "直接在下方輸入問題，系統會搜尋全文索引精準找出相關內容來回答。"
         )
         st.caption(
             "**常見問題示例：** 學校假期時間表？ / 如何申請請假？ / "
@@ -231,8 +253,7 @@ if prompt := st.chat_input("請輸入您的問題…"):
                 for m in st.session_state.messages[:-1]
             ]
 
-            status.write("🔍 AI 正在分析問題，選取相關文件…")
-            status.write("📄 下載並閱讀完整 PDF 內容…")
+            status.write("🔍 搜尋全文索引，找出最相關片段…")
             answer, sources = bot.chat(prompt, history)
 
             status.update(label="✅ 回答完成", state="complete", expanded=False)
