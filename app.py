@@ -5,6 +5,7 @@ School Affairs Chatbot — Streamlit UI
 import os
 import streamlit as st
 from chatbot import SchoolChatbot, ChatbotError
+from pdf_converter import PdfConversionError, convert_pdf_bytes_to_docx_bytes
 
 try:
     from dotenv import load_dotenv
@@ -19,6 +20,12 @@ def _secret(key: str) -> str:
         return st.secrets.get(key, os.getenv(key, ""))
     except Exception:
         return os.getenv(key, "")
+
+
+def _to_docx_name(filename: str) -> str:
+    if filename.lower().endswith(".pdf"):
+        return filename[:-4] + ".docx"
+    return filename
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -49,10 +56,10 @@ with st.sidebar:
         if admin_ok:
             st.success("管理員已登入 ✅")
             uploaded_files = st.file_uploader(
-                "直接拖放 Word 文件（可多選）",
-                type=["docx"],
+                "直接拖放 PDF/Word 文件（可多選）",
+                type=["pdf", "docx"],
                 accept_multiple_files=True,
-                help="上載後加入索引即可提問。",
+                help="PDF 會先自動轉成 DOCX，再加入索引。",
                 key="doc_uploader",
             )
             if uploaded_files:
@@ -171,24 +178,44 @@ if upload_btn and uploaded_files:
     if not qwen_api_key:
         st.sidebar.error("⚠️ 請先填寫 Qwen API Key")
     else:
-        bot   = get_chatbot()
+        bot = get_chatbot()
         names: list[str] = []
+        failed: list[tuple[str, str]] = []
         progress = st.sidebar.progress(0, text="正在處理上傳文件…")
 
-        for i, uf in enumerate(uploaded_files):
+        for i, uf in enumerate(uploaded_files, start=1):
             progress.progress(
-                int(i / len(uploaded_files) * 100),
-                text=f"正在讀取 {uf.name}…",
+                int((i - 1) / len(uploaded_files) * 100),
+                text=f"正在處理 {uf.name}…",
             )
-            doc_bytes = uf.getvalue()
-            bot.ingest_uploaded_doc(uf.name, doc_bytes)
-            names.append(uf.name)
-            # Silently push to GitHub for permanent storage
-            if github_repo and github_token:
-                try:
-                    bot.push_doc_to_github(uf.name, doc_bytes)
-                except ChatbotError:
-                    pass
+            file_name = uf.name
+            raw_bytes = uf.getvalue()
+
+            try:
+                if file_name.lower().endswith(".pdf"):
+                    progress.progress(
+                        int((i - 0.5) / len(uploaded_files) * 100),
+                        text=f"正在轉換 PDF：{file_name}…",
+                    )
+                    doc_name = _to_docx_name(file_name)
+                    doc_bytes = convert_pdf_bytes_to_docx_bytes(raw_bytes, file_name)
+                else:
+                    doc_name = _to_docx_name(file_name)
+                    doc_bytes = raw_bytes
+
+                bot.ingest_uploaded_doc(doc_name, doc_bytes)
+                names.append(doc_name)
+
+                # Silently push DOCX to GitHub for permanent storage
+                if github_repo and github_token:
+                    try:
+                        bot.push_doc_to_github(doc_name, doc_bytes)
+                    except ChatbotError:
+                        pass
+            except PdfConversionError as e:
+                failed.append((file_name, str(e)))
+            except Exception as e:
+                failed.append((file_name, f"處理失敗：{e}"))
 
         progress.empty()
 
@@ -202,7 +229,12 @@ if upload_btn and uploaded_files:
             except Exception:
                 pass
 
-        st.sidebar.success(f"✅ 已上傳並建立索引：{len(names)} 個文件")
+        if names:
+            st.sidebar.success(f"✅ 已上傳並建立索引：{len(names)} 個 DOCX 文件")
+        if failed:
+            st.sidebar.warning(f"⚠️ 有 {len(failed)} 個檔案處理失敗")
+            for file_name, reason in failed:
+                st.sidebar.caption(f"• {file_name}：{reason}")
         st.rerun()
 
 if clear_btn:

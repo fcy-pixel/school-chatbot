@@ -2,9 +2,9 @@
 School Affairs Chatbot — Core Logic (RAG)
 Strategy:
   1. On startup: download ALL Word docs, split into large overlapping chunks,
-     build an in-memory keyword index (full-text, not just summaries).
+      build an in-memory keyword index (full-text, not just summaries).
   2. Per query: score every chunk by CJK character + Latin word overlap;
-     pick the top-K most relevant chunks from across all documents.
+      pick the top-K most relevant chunks from across all documents.
   3. Send only those chunks to Qwen — accurate and efficient.
 """
 
@@ -30,7 +30,7 @@ class ChatbotError(Exception):
 
 
 class Chunk:
-    """A text chunk from a PDF with pre-tokenised keyword sets for fast scoring."""
+    """A text chunk from a document with pre-tokenised keyword sets for fast scoring."""
     __slots__ = ("text", "source", "page_tag", "tok_cjk", "tok_latin")
 
     def __init__(self, text: str, source: str, page_tag: str):
@@ -325,7 +325,7 @@ class SchoolChatbot:
         context = ("\n\n" + "─" * 40 + "\n\n").join(context_parts)
 
         system_msg = (
-            "你是一位專業的學校事務助手，根據學校官方 PDF 文件回答問題。\n"
+            "你是一位專業的學校事務助手，根據學校官方 DOCX 文件回答問題。\n"
             "規則：\n"
             "• 只根據所提供的文件內容回答，不可憑空猜測。\n"
             "• 使用繁體中文，語氣親切、專業。\n"
