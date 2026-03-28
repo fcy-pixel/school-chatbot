@@ -72,6 +72,29 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader("📤 上載 PDF 文件")
+    uploaded_files = st.file_uploader(
+        "直接上載 PDF（可檔名不反映內容）",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="直接拖放 PDF 即可加入索引。不需要 GitHub 倉庫也能使用。",
+        key="pdf_uploader",
+    )
+    if uploaded_files:
+        upload_btn = st.button(
+            f"➕ 加入索引（{len(uploaded_files)} 個檔案）",
+            use_container_width=True,
+        )
+    else:
+        upload_btn = False
+
+    # Show already-indexed uploaded files
+    if st.session_state.get("uploaded_pdf_names"):
+        st.caption(f"📁 已上載 {len(st.session_state.uploaded_pdf_names)} 個檔案：")
+        for n in st.session_state.uploaded_pdf_names:
+            st.caption(f"   📄 {n}")
+
+    st.divider()
 
     col1, col2 = st.columns(2)
     with col1:
@@ -119,13 +142,12 @@ def get_chatbot() -> SchoolChatbot:
     ):
         st.session_state.chatbot = SchoolChatbot(
             qwen_api_key=qwen_api_key,
-            github_repo=github_repo,
+            github_repo=github_repo or "",
             github_path=github_path,
             github_token=github_token or None,
             model=qwen_model,
         )
         st.session_state.chatbot_cfg_key = cfg_key
-        # Clear PDF list cache on config change
         st.session_state.pop("pdf_list", None)
     return st.session_state.chatbot
 
@@ -148,6 +170,34 @@ if load_btn:
                 st.rerun()
             except ChatbotError as e:
                 st.sidebar.error(str(e))
+
+if upload_btn and uploaded_files:
+    if not qwen_api_key:
+        st.sidebar.error("⚠️ 請先填寫 Qwen API Key")
+    else:
+        bot = get_chatbot()
+        names = []
+        progress = st.sidebar.progress(0, text="正在處理上傳文件…")
+        total_chunks = 0
+        for i, uf in enumerate(uploaded_files):
+            progress.progress(
+                int((i) / len(uploaded_files) * 100),
+                text=f"正在讀取 {uf.name}…",
+            )
+            n = bot.ingest_uploaded_pdf(uf.name, uf.getvalue())
+            total_chunks += n
+            names.append(uf.name)
+        progress.empty()
+
+        # Merge with any previous uploads
+        prev = st.session_state.get("uploaded_pdf_names", [])
+        st.session_state.uploaded_pdf_names = list(dict.fromkeys(prev + names))
+        st.session_state.index_ready  = True
+        st.session_state.chunk_count  = len(bot._chunk_index)
+        st.sidebar.success(
+            f"✅ 已加入 {len(names)} 個文件，新增 {total_chunks} 個片段"
+        )
+        st.rerun()
 
 if index_btn:
     if not qwen_api_key or not github_repo:
@@ -194,12 +244,14 @@ st.title("🏫 學校事務助手")
 if not st.session_state.messages:
     st.info(
         "👋 **歡迎使用學校事務助手！**\n\n"
-        "**快速開始：**\n"
+        "**方法 A — 上傳 PDF（最簡單）：**\n"
         "1. 在左側填寫 **Qwen API Key**\n"
-        "2. 填寫存放 PDF 文件的 **GitHub 倉庫**（格式：`username/repo`）\n"
-        "3. 點擊 **🔄 載入 PDF** 取得文件列表\n"
-        "4. （**建議**）點擊 **📚 建立全文索引** — 適合會議紀錄等檔名不反映內容的情況\n"
-        "5. 在下方輸入問題即可！"
+        "2. 在 **上傳 PDF 文件** 拖入文件\n"
+        "3. 點擊 **➕ 加入索引** 即可開始\n\n"
+        "**方法 B — GitHub 倉庫：**\n"
+        "1. 在左側填寫 **Qwen API Key** + **GitHub 倉庫**\n"
+        "2. 點擊 **🔄 載入 PDF** → **📚 建立全文索引**\n"
+        "3. 在下方輸入問題即可！"
     )
     st.caption(
         "**常見問題示例：** 學校假期時間表？/ 如何申請請假？/ "
@@ -221,8 +273,9 @@ if prompt := st.chat_input("請輸入您的問題…"):
     if not qwen_api_key:
         st.error("⚠️ 請先在左側填寫 Qwen API Key")
         st.stop()
-    if not github_repo:
-        st.error("⚠️ 請先在左側填寫 GitHub 倉庫")
+    has_uploads = bool(st.session_state.get("uploaded_pdf_names"))
+    if not github_repo and not has_uploads:
+        st.error("⚠️ 請上傳 PDF 文件，或填寫 GitHub 倉庫")
         st.stop()
 
     # Append & display user message immediately

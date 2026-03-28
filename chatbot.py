@@ -53,26 +53,30 @@ class SchoolChatbot:
     ):
         if not qwen_api_key:
             raise ChatbotError("缺少 Qwen API Key")
-        if not github_repo:
-            raise ChatbotError("缺少 GitHub 倉庫名稱")
 
         self.client = OpenAI(api_key=qwen_api_key, base_url=QWEN_BASE_URL)
-        self.github_repo  = github_repo.strip("/")
-        self.github_path  = github_path.strip("/")
+        self.github_repo  = github_repo.strip("/") if github_repo else ""
+        self.github_path  = github_path.strip("/") if github_path else ""
         self.github_token = github_token
         self.model        = model
 
         self._pdf_text_cache: dict[str, str] = {}
         self._pdf_list_cache: Optional[list[dict]] = None
-        # Full-text chunk index: built by build_index()
-        self._chunk_index: list[Chunk] = []
-        self._indexed_pdfs: set[str]   = set()   # filenames already indexed
+        # Full-text chunk index: built by build_index() or ingest_uploaded_pdf()
+        self._chunk_index: list[Chunk]  = []
+        self._indexed_pdfs: set[str]    = set()   # filenames indexed from GitHub
+        self._uploaded_pdfs: set[str]   = set()   # filenames added via upload
 
     # ── GitHub helpers ─────────────────────────────────────────────────────────
 
     @property
     def index_ready(self) -> bool:
         return len(self._chunk_index) > 0
+
+    @property
+    def has_content(self) -> bool:
+        """True if there is any content available (GitHub PDFs or uploads)."""
+        return bool(self._pdf_list_cache or self._uploaded_pdfs)
 
     def _gh_headers(self) -> dict:
         h = {"Accept": "application/vnd.github.v3+json"}
@@ -170,12 +174,44 @@ class SchoolChatbot:
 
         return chunks
 
+    def ingest_uploaded_pdf(self, name: str, data: bytes) -> int:
+        """
+        Add a user-uploaded PDF (raw bytes) to the text cache and chunk index.
+        Can be called without GitHub being configured at all.
+        Returns the number of new chunks added.
+        """
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(data))
+            pages  = []
+            for i, page in enumerate(reader.pages):
+                text = page.extract_text() or ""
+                if text.strip():
+                    pages.append(f"[第 {i + 1} 頁]\n{text.strip()}")
+            text = "\n\n".join(pages)
+            if not text.strip():
+                text = f"[{name} 無法提取文字，可能為掃描圖片版本]"
+        except Exception as e:
+            text = f"[無法讀取 {name}：{e}]"
+
+        # Remove old chunks for this file if re-uploaded
+        self._chunk_index = [c for c in self._chunk_index if c.source != name]
+        self._pdf_text_cache[name] = text
+
+        is_unreadable = "無法提取文字" in text or "無法讀取" in text
+        new_chunks: list[Chunk] = []
+        if not is_unreadable:
+            new_chunks = self._make_chunks(text, name)
+            self._chunk_index.extend(new_chunks)
+            self._uploaded_pdfs.add(name)
+
+        return len(new_chunks)
+
     def build_index(
         self,
         progress_callback=None,
     ) -> int:
         """
-        (Re-)build the full-text chunk index from all PDFs in the repo.
+        (Re-)build the full-text chunk index from all PDFs in the GitHub repo.
 
         progress_callback(current, total, filename) is called for each PDF
         if provided — useful for driving a Streamlit progress bar.
@@ -322,9 +358,9 @@ class SchoolChatbot:
 
         Returns (answer_text, [source_filenames]).
         """
-        pdf_list = self.get_pdf_list()
-        if not pdf_list:
-            return "目前倉庫中沒有 PDF 文件，請先上傳相關文件到 GitHub。", []
+        pdf_list = self.get_pdf_list() if self.github_repo else []
+        if not pdf_list and not self._uploaded_pdfs:
+            return "目前沒有任何 PDF 文件可供查閱，請上傳文件或設定 GitHub 倉庫。", []
 
         context_parts: list[str] = []
         source_files:  list[str] = []
@@ -357,9 +393,29 @@ class SchoolChatbot:
 
         # ── Path B: no index — on-the-fly filename search ──────────────────────
         else:
-            relevant = self._find_pdfs_by_filename(question, pdf_list)
+            # Combine GitHub PDFs + uploaded PDFs into a unified search list
+            combined_names = list({c.source for c in self._chunk_index})  # uploaded
+            if pdf_list:
+                combined_names += [p["name"] for p in pdf_list if p["name"] not in combined_names]
+
+            # For on-the-fly ranking we need text; uploaded files are already cached
+            candidates = []
+            for name in combined_names:
+                if name in self._pdf_text_cache:
+                    candidates.append({"name": name, "_cached": True})
+                else:
+                    match = next((p for p in pdf_list if p["name"] == name), None)
+                    if match:
+                        candidates.append(match)
+
+            relevant = self._find_pdfs_by_filename(question, candidates) if candidates else []
             for pdf in relevant:
-                text = self.extract_pdf_text(pdf)
+                name = pdf["name"]
+                # Use cached text (uploaded) or download from GitHub
+                if pdf.get("_cached") or name in self._pdf_text_cache:
+                    text = self._pdf_text_cache.get(name, "")
+                else:
+                    text = self.extract_pdf_text(pdf)
                 is_unreadable = (
                     text.startswith("[無法讀取")
                     or "無法提取文字" in text
