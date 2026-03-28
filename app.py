@@ -29,7 +29,7 @@ def _to_docx_name(filename: str) -> str:
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="學校事務助手",
+    page_title="校務會議紀錄查詢 empowerd by Qwen AI",
     page_icon="🏫",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -37,8 +37,8 @@ st.set_page_config(
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🏫 學校事務助手")
-    st.caption("School Affairs Word Chatbot · Powered by Qwen")
+    st.title("🏫 校務會議紀錄查詢")
+    st.caption("empowerd by Qwen AI")
     st.divider()
 
     qwen_api_key = _secret("QWEN_API_KEY")
@@ -272,12 +272,12 @@ if clear_btn:
 
 
 # ── Main chat area ─────────────────────────────────────────────────────────────
-st.title("🏫 學校事務助手")
+st.title("🏫 校務會議紀錄查詢")
 
 if not st.session_state.messages:
     if st.session_state.get("init_attempted"):
         st.info(
-            "👋 **歡迎使用學校事務助手！**\n\n"
+            "👋 **歡迎使用校務會議紀錄查詢！**\n\n"
             "直接在下方輸入問題，系統會搜尋全文索引精準找出相關內容來回答。"
         )
         st.caption(
