@@ -68,16 +68,9 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         load_btn = st.button("🔄 重新整理", use_container_width=True,
-                             help="重新載入 PDF 列表並重建全文索引")
+                         help="重新取得 PDF 列表")
     with col2:
         clear_btn = st.button("🗑️ 清除對話", use_container_width=True)
-
-    # Index status badge
-    if st.session_state.get("index_ready"):
-        chunk_count = st.session_state.get("chunk_count", 0)
-        st.success(f"✅ 索引已就緒（{chunk_count} 個片段）", icon="📚")
-    elif st.session_state.get("init_attempted") and not st.session_state.get("index_ready"):
-        st.warning("⚠️ 未能建立索引，請點擊重新整理", icon="⚠️")
 
     # Show loaded PDF list
     if "pdf_list" in st.session_state and st.session_state.pdf_list:
@@ -113,25 +106,16 @@ def get_chatbot() -> SchoolChatbot:
     return st.session_state.chatbot
 
 
-# ── Auto-init: load PDFs + build full-text index on first visit ───────────────
-if qwen_api_key and github_repo and not st.session_state.get("index_ready") and not st.session_state.get("init_attempted"):
+# ── Auto-init: load PDF list on first visit ───────────────────────────────────
+if qwen_api_key and github_repo and not st.session_state.get("init_attempted"):
     st.session_state.init_attempted = True
     _placeholder = st.empty()
     with _placeholder.container():
-        st.info("⏳ 正在初始化，載入 PDF 並建立全文索引，請稍候…")
-        _bar = st.progress(0, text="正在取得 PDF 列表…")
+        st.info("⏳ 正在從 GitHub 載入 PDF 列表，請稍候…")
     try:
         _bot = get_chatbot()
         _pdfs = _bot.get_pdf_list(force_refresh=True)
         st.session_state.pdf_list = _pdfs
-        if _pdfs:
-            def _auto_progress(current, total, filename):
-                if total:
-                    _bar.progress(int(current / total * 100),
-                                  text=f"正在讀取 {current}/{total}：{filename}")
-            _chunks = _bot.build_index(progress_callback=_auto_progress)
-            st.session_state.index_ready = True
-            st.session_state.chunk_count = _chunks
     except ChatbotError as _e:
         _placeholder.error(f"⚠️ 初始化失敗：{_e}")
     else:
@@ -143,28 +127,13 @@ if load_btn:
     if not qwen_api_key or not github_repo:
         st.sidebar.error("⚠️ 設定未完成，請聯絡管理員")
     else:
-        _ph = st.empty()
-        with _ph.container():
-            st.info("🔄 正在重新載入 PDF 並重建索引…")
-            _rb = st.progress(0, text="正在取得 PDF 列表…")
         try:
             bot  = get_chatbot()
             pdfs = bot.get_pdf_list(force_refresh=True)
-            st.session_state.pdf_list    = pdfs
-            st.session_state.index_ready = False
-            if pdfs:
-                def _reload_progress(current, total, filename):
-                    if total:
-                        _rb.progress(int(current / total * 100),
-                                     text=f"正在讀取 {current}/{total}：{filename}")
-                chunk_count = bot.build_index(progress_callback=_reload_progress)
-                st.session_state.index_ready = True
-                st.session_state.chunk_count = chunk_count
+            st.session_state.pdf_list       = pdfs
             st.session_state.init_attempted = True
         except ChatbotError as e:
-            _ph.error(str(e))
-        else:
-            _ph.empty()
+            st.sidebar.error(str(e))
         st.rerun()
 
 if upload_btn and uploaded_files:
@@ -174,7 +143,6 @@ if upload_btn and uploaded_files:
         bot = get_chatbot()
         names: list[str] = []
         progress = st.sidebar.progress(0, text="正在處理上傳文件…")
-        total_chunks = 0
 
         for i, uf in enumerate(uploaded_files):
             progress.progress(
@@ -182,8 +150,7 @@ if upload_btn and uploaded_files:
                 text=f"正在讀取 {uf.name}…",
             )
             pdf_bytes = uf.getvalue()
-            n = bot.ingest_uploaded_pdf(uf.name, pdf_bytes)
-            total_chunks += n
+            bot.ingest_uploaded_pdf(uf.name, pdf_bytes)
             names.append(uf.name)
             # Silently push to GitHub for permanent storage
             if github_repo and github_token:
@@ -196,8 +163,6 @@ if upload_btn and uploaded_files:
 
         prev = st.session_state.get("uploaded_pdf_names", [])
         st.session_state.uploaded_pdf_names = list(dict.fromkeys(prev + names))
-        st.session_state.index_ready = True
-        st.session_state.chunk_count = len(bot._chunk_index)
 
         # Refresh PDF list if files were pushed to GitHub
         if github_repo and github_token:
@@ -206,7 +171,7 @@ if upload_btn and uploaded_files:
             except Exception:
                 pass
 
-        st.sidebar.success(f"✅ 已加入 {len(names)} 個文件，新增 {total_chunks} 個片段")
+        st.sidebar.success(f"✅ 已加入 {len(names)} 個文件")
         st.rerun()
 
 if clear_btn:
@@ -218,22 +183,17 @@ if clear_btn:
 st.title("🏫 學校事務助手")
 
 if not st.session_state.messages:
-    if st.session_state.get("index_ready"):
+    if st.session_state.get("init_attempted"):
         st.info(
             "👋 **歡迎使用學校事務助手！**\n\n"
-            "索引已就緒，直接在下方輸入問題即可獲得答案。"
+            "直接在下方輸入問題，系統會自動選取相關文件並閱讀全文來回答。"
         )
         st.caption(
             "**常見問題示例：** 學校假期時間表？ / 如何申請請假？ / "
             "制服規定是什麼？ / 考試時間表？ / 學費繳交日期？"
         )
-    elif not st.session_state.get("init_attempted"):
-        st.info("⏳ 系統正在初始化，請稍候…")
     else:
-        st.warning(
-            "⚠️ 索引尚未建立。\n\n"
-            "請在左側點擊 **🔄 重新整理**，或直接上傳 PDF 文件。"
-        )
+        st.info("⏳ 系統正在載入文件列表，請稍候…")
 
 # Render chat history
 for msg in st.session_state.messages:
@@ -271,11 +231,8 @@ if prompt := st.chat_input("請輸入您的問題…"):
                 for m in st.session_state.messages[:-1]
             ]
 
-            if bot.index_ready:
-                status.write("📚 全文搜索索引中，尋找相關片段…")
-            else:
-                status.write("🔍 分析問題，篩選相關 PDF（建議點擊「建立全文索引」以提高準確度）…")
-                status.write("📥 下載並讀取相關 PDF…")
+            status.write("🔍 AI 正在分析問題，選取相關文件…")
+            status.write("📄 下載並閱讀完整 PDF 內容…")
             answer, sources = bot.chat(prompt, history)
 
             status.update(label="✅ 回答完成", state="complete", expanded=False)
