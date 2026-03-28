@@ -67,25 +67,17 @@ with st.sidebar:
 
     col1, col2 = st.columns(2)
     with col1:
-        load_btn = st.button("🔄 載入 PDF", use_container_width=True,
-                             help="取得 GitHub 上的 PDF 文件列表")
+        load_btn = st.button("🔄 重新整理", use_container_width=True,
+                             help="重新載入 PDF 列表並重建全文索引")
     with col2:
         clear_btn = st.button("🗑️ 清除對話", use_container_width=True)
-
-    index_btn = st.button(
-        "📚 建立全文索引",
-        use_container_width=True,
-        disabled="pdf_list" not in st.session_state or not st.session_state.get("pdf_list"),
-        help="讀取所有 PDF 內容並建立全文搜索索引。\n"
-             "適合會議紀錄等檔名不反映內容的文件。",
-    )
 
     # Index status badge
     if st.session_state.get("index_ready"):
         chunk_count = st.session_state.get("chunk_count", 0)
-        st.success(f"✅ 全文索引已建立（{chunk_count} 個片段）", icon="📚")
-    elif "pdf_list" in st.session_state and st.session_state.pdf_list:
-        st.info("💡 建議點擊 **建立全文索引** 以提高搜索準確度", icon="ℹ️")
+        st.success(f"✅ 索引已就緒（{chunk_count} 個片段）", icon="📚")
+    elif st.session_state.get("init_attempted") and not st.session_state.get("index_ready"):
+        st.warning("⚠️ 未能建立索引，請點擊重新整理", icon="⚠️")
 
     # Show loaded PDF list
     if "pdf_list" in st.session_state and st.session_state.pdf_list:
@@ -121,24 +113,59 @@ def get_chatbot() -> SchoolChatbot:
     return st.session_state.chatbot
 
 
+# ── Auto-init: load PDFs + build full-text index on first visit ───────────────
+if qwen_api_key and github_repo and not st.session_state.get("index_ready") and not st.session_state.get("init_attempted"):
+    st.session_state.init_attempted = True
+    _placeholder = st.empty()
+    with _placeholder.container():
+        st.info("⏳ 正在初始化，載入 PDF 並建立全文索引，請稍候…")
+        _bar = st.progress(0, text="正在取得 PDF 列表…")
+    try:
+        _bot = get_chatbot()
+        _pdfs = _bot.get_pdf_list(force_refresh=True)
+        st.session_state.pdf_list = _pdfs
+        if _pdfs:
+            def _auto_progress(current, total, filename):
+                if total:
+                    _bar.progress(int(current / total * 100),
+                                  text=f"正在讀取 {current}/{total}：{filename}")
+            _chunks = _bot.build_index(progress_callback=_auto_progress)
+            st.session_state.index_ready = True
+            st.session_state.chunk_count = _chunks
+    except ChatbotError as _e:
+        _placeholder.error(f"⚠️ 初始化失敗：{_e}")
+    else:
+        _placeholder.empty()
+    st.rerun()
+
 # ── Button handlers ────────────────────────────────────────────────────────────
 if load_btn:
     if not qwen_api_key or not github_repo:
-        st.sidebar.error("⚠️ 請填寫 Qwen API Key 和 GitHub 倉庫")
+        st.sidebar.error("⚠️ 設定未完成，請聯絡管理員")
     else:
-        with st.spinner("正在連接 GitHub，載入 PDF 列表…"):
-            try:
-                bot  = get_chatbot()
-                pdfs = bot.get_pdf_list(force_refresh=True)
-                st.session_state.pdf_list   = pdfs
-                st.session_state.index_ready = False   # new PDF list → index stale
-                if pdfs:
-                    st.sidebar.success(f"✅ 成功載入 {len(pdfs)} 個 PDF")
-                else:
-                    st.sidebar.warning("⚠️ 該目錄下沒有找到 PDF 文件")
-                st.rerun()
-            except ChatbotError as e:
-                st.sidebar.error(str(e))
+        _ph = st.empty()
+        with _ph.container():
+            st.info("🔄 正在重新載入 PDF 並重建索引…")
+            _rb = st.progress(0, text="正在取得 PDF 列表…")
+        try:
+            bot  = get_chatbot()
+            pdfs = bot.get_pdf_list(force_refresh=True)
+            st.session_state.pdf_list    = pdfs
+            st.session_state.index_ready = False
+            if pdfs:
+                def _reload_progress(current, total, filename):
+                    if total:
+                        _rb.progress(int(current / total * 100),
+                                     text=f"正在讀取 {current}/{total}：{filename}")
+                chunk_count = bot.build_index(progress_callback=_reload_progress)
+                st.session_state.index_ready = True
+                st.session_state.chunk_count = chunk_count
+            st.session_state.init_attempted = True
+        except ChatbotError as e:
+            _ph.error(str(e))
+        else:
+            _ph.empty()
+        st.rerun()
 
 if upload_btn and uploaded_files:
     if not qwen_api_key:
@@ -182,40 +209,6 @@ if upload_btn and uploaded_files:
         st.sidebar.success(f"✅ 已加入 {len(names)} 個文件，新增 {total_chunks} 個片段")
         st.rerun()
 
-if index_btn:
-    if not qwen_api_key or not github_repo:
-        st.sidebar.error("⚠️ 請先填寫 Qwen API Key 和 GitHub 倉庫")
-    else:
-        try:
-            bot   = get_chatbot()
-            pdfs  = st.session_state.pdf_list
-            total = len(pdfs)
-
-            progress_bar  = st.sidebar.progress(0, text="準備讀取 PDF…")
-            status_text   = st.sidebar.empty()
-
-            def on_progress(current, total, filename):
-                if total == 0:
-                    return
-                pct = int(current / total * 100)
-                progress_bar.progress(
-                    pct,
-                    text=f"正在讀取 {current}/{total}：{filename}",
-                )
-
-            chunk_count = bot.build_index(progress_callback=on_progress)
-            progress_bar.empty()
-
-            st.session_state.index_ready = True
-            st.session_state.chunk_count = chunk_count
-            st.sidebar.success(
-                f"✅ 全文索引建立完成！共 {chunk_count} 個片段，"
-                f"覆蓋 {len(bot._indexed_pdfs)} 個 PDF"
-            )
-            st.rerun()
-        except ChatbotError as e:
-            st.sidebar.error(str(e))
-
 if clear_btn:
     st.session_state.messages = []
     st.rerun()
@@ -225,21 +218,22 @@ if clear_btn:
 st.title("🏫 學校事務助手")
 
 if not st.session_state.messages:
-    st.info(
-        "👋 **歡迎使用學校事務助手！**\n\n"
-        "**方法 A — 上傳 PDF（最簡單）：**\n"
-        "1. 在左側填寫 **Qwen API Key**\n"
-        "2. 在 **上傳 PDF 文件** 拖入文件\n"
-        "3. 點擊 **➕ 加入索引** 即可開始\n\n"
-        "**方法 B — GitHub 倉庫：**\n"
-        "1. 在左側填寫 **Qwen API Key** + **GitHub 倉庫**\n"
-        "2. 點擊 **🔄 載入 PDF** → **📚 建立全文索引**\n"
-        "3. 在下方輸入問題即可！"
-    )
-    st.caption(
-        "**常見問題示例：** 學校假期時間表？/ 如何申請請假？/ "
-        "制服規定是什麼？/ 考試時間表？/ 學費繳交日期？"
-    )
+    if st.session_state.get("index_ready"):
+        st.info(
+            "👋 **歡迎使用學校事務助手！**\n\n"
+            "索引已就緒，直接在下方輸入問題即可獲得答案。"
+        )
+        st.caption(
+            "**常見問題示例：** 學校假期時間表？ / 如何申請請假？ / "
+            "制服規定是什麼？ / 考試時間表？ / 學費繳交日期？"
+        )
+    elif not st.session_state.get("init_attempted"):
+        st.info("⏳ 系統正在初始化，請稍候…")
+    else:
+        st.warning(
+            "⚠️ 索引尚未建立。\n\n"
+            "請在左側點擊 **🔄 重新整理**，或直接上傳 PDF 文件。"
+        )
 
 # Render chat history
 for msg in st.session_state.messages:
